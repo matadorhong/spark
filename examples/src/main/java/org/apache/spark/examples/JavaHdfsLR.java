@@ -17,6 +17,7 @@
 
 package org.apache.spark.examples;
 
+import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.Function;
@@ -29,11 +30,24 @@ import java.util.regex.Pattern;
 
 /**
  * Logistic regression based classification.
+ *
+ * This is an example implementation for learning how to use Spark. For more conventional use,
+ * please refer to either org.apache.spark.mllib.classification.LogisticRegressionWithSGD or
+ * org.apache.spark.mllib.classification.LogisticRegressionWithLBFGS based on your needs.
  */
 public final class JavaHdfsLR {
 
   private static final int D = 10;   // Number of dimensions
   private static final Random rand = new Random(42);
+
+  static void showWarning() {
+    String warning = "WARN: This is a naive implementation of Logistic Regression " +
+            "and is given as an example!\n" +
+            "Please use either org.apache.spark.mllib.classification.LogisticRegressionWithSGD " +
+            "or org.apache.spark.mllib.classification.LogisticRegressionWithLBFGS " +
+            "for more conventional use.";
+    System.err.println(warning);
+  }
 
   static class DataPoint implements Serializable {
     DataPoint(double[] x, double y) {
@@ -103,16 +117,18 @@ public final class JavaHdfsLR {
 
   public static void main(String[] args) {
 
-    if (args.length < 3) {
-      System.err.println("Usage: JavaHdfsLR <master> <file> <iters>");
+    if (args.length < 2) {
+      System.err.println("Usage: JavaHdfsLR <file> <iters>");
       System.exit(1);
     }
 
-    JavaSparkContext sc = new JavaSparkContext(args[0], "JavaHdfsLR",
-        System.getenv("SPARK_HOME"), JavaSparkContext.jarOfClass(JavaHdfsLR.class));
-    JavaRDD<String> lines = sc.textFile(args[1]);
+    showWarning();
+
+    SparkConf sparkConf = new SparkConf().setAppName("JavaHdfsLR");
+    JavaSparkContext sc = new JavaSparkContext(sparkConf);
+    JavaRDD<String> lines = sc.textFile(args[0]);
     JavaRDD<DataPoint> points = lines.map(new ParsePoint()).cache();
-    int ITERATIONS = Integer.parseInt(args[2]);
+    int ITERATIONS = Integer.parseInt(args[1]);
 
     // Initialize w to a random value
     double[] w = new double[D];

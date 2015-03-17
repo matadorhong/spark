@@ -22,9 +22,9 @@ import java.util.Random
 import scala.math.exp
 
 import breeze.linalg.{Vector, DenseVector}
+import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark._
-import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.scheduler.InputFormatInfo
 import org.apache.spark.storage.StorageLevel
 
@@ -32,10 +32,23 @@ import org.apache.spark.storage.StorageLevel
 /**
  * Logistic regression based classification.
  * This example uses Tachyon to persist rdds during computation.
+ *
+ * This is an example implementation for learning how to use Spark. For more conventional use,
+ * please refer to either org.apache.spark.mllib.classification.LogisticRegressionWithSGD or
+ * org.apache.spark.mllib.classification.LogisticRegressionWithLBFGS based on your needs.
  */
 object SparkTachyonHdfsLR {
   val D = 10   // Numer of dimensions
   val rand = new Random(42)
+
+  def showWarning() {
+    System.err.println(
+      """WARN: This is a naive implementation of Logistic Regression and is given as an example!
+        |Please use either org.apache.spark.mllib.classification.LogisticRegressionWithSGD or
+        |org.apache.spark.mllib.classification.LogisticRegressionWithLBFGS
+        |for more conventional use.
+      """.stripMargin)
+  }
 
   case class DataPoint(x: Vector[Double], y: Double)
 
@@ -51,20 +64,19 @@ object SparkTachyonHdfsLR {
   }
 
   def main(args: Array[String]) {
-    if (args.length < 3) {
-      System.err.println("Usage: SparkTachyonHdfsLR <master> <file> <iters>")
-      System.exit(1)
-    }
-    val inputPath = args(1)
-    val conf = SparkHadoopUtil.get.newConfiguration()
-    val sc = new SparkContext(args(0), "SparkTachyonHdfsLR",
-      System.getenv("SPARK_HOME"), SparkContext.jarOfClass(this.getClass).toSeq, Map(),
+
+    showWarning()
+
+    val inputPath = args(0)
+    val sparkConf = new SparkConf().setAppName("SparkTachyonHdfsLR")
+    val conf = new Configuration()
+    val sc = new SparkContext(sparkConf,
       InputFormatInfo.computePreferredLocations(
         Seq(new InputFormatInfo(conf, classOf[org.apache.hadoop.mapred.TextInputFormat], inputPath))
       ))
     val lines = sc.textFile(inputPath)
     val points = lines.map(parsePoint _).persist(StorageLevel.OFF_HEAP)
-    val ITERATIONS = args(2).toInt
+    val ITERATIONS = args(1).toInt
 
     // Initialize w to a random value
     var w = DenseVector.fill(D){2 * rand.nextDouble - 1}

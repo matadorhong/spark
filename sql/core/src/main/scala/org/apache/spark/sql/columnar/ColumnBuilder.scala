@@ -20,15 +20,15 @@ package org.apache.spark.sql.columnar
 import java.nio.{ByteBuffer, ByteOrder}
 
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.catalyst.types._
 import org.apache.spark.sql.columnar.ColumnBuilder._
 import org.apache.spark.sql.columnar.compression.{AllCompressionSchemes, CompressibleColumnBuilder}
+import org.apache.spark.sql.types._
 
 private[sql] trait ColumnBuilder {
   /**
    * Initializes with an approximate lower bound on the expected number of elements in this column.
    */
-  def initialize(initialSize: Int, columnName: String = "")
+  def initialize(initialSize: Int, columnName: String = "", useCompression: Boolean = false)
 
   /**
    * Appends `row(ordinal)` to the column builder.
@@ -38,7 +38,7 @@ private[sql] trait ColumnBuilder {
   /**
    * Column statistics information
    */
-  def columnStats: ColumnStats[_, _]
+  def columnStats: ColumnStats
 
   /**
    * Returns the final columnar byte buffer.
@@ -47,7 +47,7 @@ private[sql] trait ColumnBuilder {
 }
 
 private[sql] class BasicColumnBuilder[T <: DataType, JvmType](
-    val columnStats: ColumnStats[T, JvmType],
+    val columnStats: ColumnStats,
     val columnType: ColumnType[T, JvmType])
   extends ColumnBuilder {
 
@@ -55,7 +55,11 @@ private[sql] class BasicColumnBuilder[T <: DataType, JvmType](
 
   protected var buffer: ByteBuffer = _
 
-  override def initialize(initialSize: Int, columnName: String = "") = {
+  override def initialize(
+      initialSize: Int,
+      columnName: String = "",
+      useCompression: Boolean = false) = {
+
     val size = if (initialSize == 0) DEFAULT_INITIAL_BUFFER_SIZE else initialSize
     this.columnName = columnName
 
@@ -64,25 +68,24 @@ private[sql] class BasicColumnBuilder[T <: DataType, JvmType](
     buffer.order(ByteOrder.nativeOrder()).putInt(columnType.typeId)
   }
 
-  override def appendFrom(row: Row, ordinal: Int) {
-    val field = columnType.getField(row, ordinal)
-    buffer = ensureFreeSpace(buffer, columnType.actualSize(field))
-    columnType.append(field, buffer)
+  override def appendFrom(row: Row, ordinal: Int): Unit = {
+    buffer = ensureFreeSpace(buffer, columnType.actualSize(row, ordinal))
+    columnType.append(row, ordinal, buffer)
   }
 
   override def build() = {
-    buffer.limit(buffer.position()).rewind()
-    buffer
+    buffer.flip().asInstanceOf[ByteBuffer]
   }
 }
 
 private[sql] abstract class ComplexColumnBuilder[T <: DataType, JvmType](
+    columnStats: ColumnStats,
     columnType: ColumnType[T, JvmType])
-  extends BasicColumnBuilder[T, JvmType](new NoopColumnStats[T, JvmType], columnType)
+  extends BasicColumnBuilder[T, JvmType](columnStats, columnType)
   with NullableColumnBuilder
 
 private[sql] abstract class NativeColumnBuilder[T <: NativeType](
-    override val columnStats: NativeColumnStats[T],
+    override val columnStats: ColumnStats,
     override val columnType: NativeColumnType[T])
   extends BasicColumnBuilder[T, T#JvmType](columnStats, columnType)
   with NullableColumnBuilder
@@ -103,15 +106,28 @@ private[sql] class DoubleColumnBuilder extends NativeColumnBuilder(new DoubleCol
 
 private[sql] class FloatColumnBuilder extends NativeColumnBuilder(new FloatColumnStats, FLOAT)
 
+private[sql] class FixedDecimalColumnBuilder(
+    precision: Int,
+    scale: Int)
+  extends NativeColumnBuilder(
+    new FixedDecimalColumnStats,
+    FIXED_DECIMAL(precision, scale))
+
 private[sql] class StringColumnBuilder extends NativeColumnBuilder(new StringColumnStats, STRING)
 
-private[sql] class BinaryColumnBuilder extends ComplexColumnBuilder(BINARY)
+private[sql] class DateColumnBuilder extends NativeColumnBuilder(new DateColumnStats, DATE)
+
+private[sql] class TimestampColumnBuilder
+  extends NativeColumnBuilder(new TimestampColumnStats, TIMESTAMP)
+
+private[sql] class BinaryColumnBuilder extends ComplexColumnBuilder(new BinaryColumnStats, BINARY)
 
 // TODO (lian) Add support for array, struct and map
-private[sql] class GenericColumnBuilder extends ComplexColumnBuilder(GENERIC)
+private[sql] class GenericColumnBuilder
+  extends ComplexColumnBuilder(new GenericColumnStats, GENERIC)
 
 private[sql] object ColumnBuilder {
-  val DEFAULT_INITIAL_BUFFER_SIZE = 10 * 1024 * 104
+  val DEFAULT_INITIAL_BUFFER_SIZE = 1024 * 1024
 
   private[columnar] def ensureFreeSpace(orig: ByteBuffer, size: Int) = {
     if (orig.remaining >= size) {
@@ -122,7 +138,6 @@ private[sql] object ColumnBuilder {
       val newSize = capacity + size.max(capacity / 8 + 1)
       val pos = orig.position()
 
-      orig.clear()
       ByteBuffer
         .allocate(newSize)
         .order(ByteOrder.nativeOrder())
@@ -130,21 +145,28 @@ private[sql] object ColumnBuilder {
     }
   }
 
-  def apply(typeId: Int, initialSize: Int = 0, columnName: String = ""): ColumnBuilder = {
-    val builder = (typeId match {
-      case INT.typeId     => new IntColumnBuilder
-      case LONG.typeId    => new LongColumnBuilder
-      case FLOAT.typeId   => new FloatColumnBuilder
-      case DOUBLE.typeId  => new DoubleColumnBuilder
-      case BOOLEAN.typeId => new BooleanColumnBuilder
-      case BYTE.typeId    => new ByteColumnBuilder
-      case SHORT.typeId   => new ShortColumnBuilder
-      case STRING.typeId  => new StringColumnBuilder
-      case BINARY.typeId  => new BinaryColumnBuilder
-      case GENERIC.typeId => new GenericColumnBuilder
-    }).asInstanceOf[ColumnBuilder]
+  def apply(
+      dataType: DataType,
+      initialSize: Int = 0,
+      columnName: String = "",
+      useCompression: Boolean = false): ColumnBuilder = {
+    val builder: ColumnBuilder = dataType match {
+      case IntegerType => new IntColumnBuilder
+      case LongType => new LongColumnBuilder
+      case DoubleType => new DoubleColumnBuilder
+      case BooleanType => new BooleanColumnBuilder
+      case ByteType => new ByteColumnBuilder
+      case ShortType => new ShortColumnBuilder
+      case StringType => new StringColumnBuilder
+      case BinaryType => new BinaryColumnBuilder
+      case DateType => new DateColumnBuilder
+      case TimestampType => new TimestampColumnBuilder
+      case DecimalType.Fixed(precision, scale) if precision < 19 =>
+        new FixedDecimalColumnBuilder(precision, scale)
+      case _ => new GenericColumnBuilder
+    }
 
-    builder.initialize(initialSize, columnName)
+    builder.initialize(initialSize, columnName, useCompression)
     builder
   }
 }

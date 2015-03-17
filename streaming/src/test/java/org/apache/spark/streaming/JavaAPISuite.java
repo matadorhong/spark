@@ -17,14 +17,20 @@
 
 package org.apache.spark.streaming;
 
-import org.apache.spark.streaming.api.java.*;
+import java.io.*;
+import java.lang.Iterable;
+import java.nio.charset.Charset;
+import java.util.*;
+
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
 import scala.Tuple2;
 
 import org.junit.Assert;
+import static org.junit.Assert.*;
 import org.junit.Test;
-import java.io.*;
-import java.util.*;
-import java.lang.Iterable;
 
 import com.google.common.base.Optional;
 import com.google.common.collect.Lists;
@@ -37,6 +43,8 @@ import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.*;
 import org.apache.spark.storage.StorageLevel;
+import org.apache.spark.streaming.api.java.*;
+import org.apache.spark.util.Utils;
 
 // The test suite itself is Serializable so that anonymous Function implementations can be
 // serialized, as an alternative to converting these anonymous classes to static inner classes;
@@ -54,6 +62,10 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
       equalIterator(a.iterator(), b.iterator());
   }
 
+  @Test
+  public void testInitialization() {
+    Assert.assertNotNull(ssc.sparkContext());
+  }
 
   @SuppressWarnings("unchecked")
   @Test
@@ -294,7 +306,18 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
 
   @SuppressWarnings("unchecked")
   @Test
-  public void testReduceByWindow() {
+  public void testReduceByWindowWithInverse() {
+    testReduceByWindow(true);
+  }
+
+  @SuppressWarnings("unchecked")
+  @Test
+  public void testReduceByWindowWithoutInverse() {
+    testReduceByWindow(false);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void testReduceByWindow(boolean withInverse) {
     List<List<Integer>> inputData = Arrays.asList(
         Arrays.asList(1,2,3),
         Arrays.asList(4,5,6),
@@ -307,8 +330,14 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
         Arrays.asList(24));
 
     JavaDStream<Integer> stream = JavaTestUtils.attachTestInputStream(ssc, inputData, 1);
-    JavaDStream<Integer> reducedWindowed = stream.reduceByWindow(new IntegerSum(),
+    JavaDStream<Integer> reducedWindowed = null;
+    if (withInverse) {
+      reducedWindowed = stream.reduceByWindow(new IntegerSum(),
         new IntegerDifference(), new Duration(2000), new Duration(1000));
+    } else {
+      reducedWindowed = stream.reduceByWindow(new IntegerSum(),
+        new Duration(2000), new Duration(1000));
+    }
     JavaTestUtils.attachTestOutputStream(reducedWindowed);
     List<List<Integer>> result = JavaTestUtils.runStreams(ssc, 4, 4);
 
@@ -656,8 +685,9 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
     JavaDStream<Long> transformed1 = ssc.transform(
       listOfDStreams1,
       new Function2<List<JavaRDD<?>>, Time, JavaRDD<Long>>() {
+        @Override
         public JavaRDD<Long> call(List<JavaRDD<?>> listOfRDDs, Time time) {
-          assert(listOfRDDs.size() == 2);
+          Assert.assertEquals(2, listOfRDDs.size());
           return null;
         }
       }
@@ -669,8 +699,9 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
     JavaPairDStream<Integer, Tuple2<Integer, String>> transformed2 = ssc.transformToPair(
       listOfDStreams2,
       new Function2<List<JavaRDD<?>>, Time, JavaPairRDD<Integer, Tuple2<Integer, String>>>() {
+        @Override
         public JavaPairRDD<Integer, Tuple2<Integer, String>> call(List<JavaRDD<?>> listOfRDDs, Time time) {
-          assert(listOfRDDs.size() == 3);
+          Assert.assertEquals(3, listOfRDDs.size());
           JavaRDD<Integer> rdd1 = (JavaRDD<Integer>)listOfRDDs.get(0);
           JavaRDD<Integer> rdd2 = (JavaRDD<Integer>)listOfRDDs.get(1);
           JavaRDD<Tuple2<Integer, String>> rdd3 = (JavaRDD<Tuple2<Integer, String>>)listOfRDDs.get(2);
@@ -801,15 +832,17 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
    * Performs an order-invariant comparison of lists representing two RDD streams. This allows
    * us to account for ordering variation within individual RDD's which occurs during windowing.
    */
-  public static <T extends Comparable<T>> void assertOrderInvariantEquals(
+  public static <T> void assertOrderInvariantEquals(
       List<List<T>> expected, List<List<T>> actual) {
+    List<Set<T>> expectedSets = new ArrayList<Set<T>>();
     for (List<T> list: expected) {
-      Collections.sort(list);
+      expectedSets.add(Collections.unmodifiableSet(new HashSet<T>(list)));
     }
+    List<Set<T>> actualSets = new ArrayList<Set<T>>();
     for (List<T> list: actual) {
-      Collections.sort(list);
+      actualSets.add(Collections.unmodifiableSet(new HashSet<T>(list)));
     }
-    Assert.assertEquals(expected, actual);
+    Assert.assertEquals(expectedSets, actualSets);
   }
 
 
@@ -962,7 +995,7 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
             });
 
     JavaTestUtils.attachTestOutputStream(reversed);
-    List<List<Tuple2<Integer, String>>> result = JavaTestUtils.runStreams(ssc, 2, 2);
+    List<List<Integer>> result = JavaTestUtils.runStreams(ssc, 2, 2);
 
     Assert.assertEquals(expected, result);
   }
@@ -1005,7 +1038,7 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
           }
         });
     JavaTestUtils.attachTestOutputStream(flatMapped);
-    List<List<Tuple2<String, Integer>>> result = JavaTestUtils.runStreams(ssc, 2, 2);
+    List<List<Tuple2<Integer, String>>> result = JavaTestUtils.runStreams(ssc, 2, 2);
 
     Assert.assertEquals(expected, result);
   }
@@ -1156,9 +1189,9 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
     JavaTestUtils.attachTestOutputStream(groupWindowed);
     List<List<Tuple2<String, List<Integer>>>> result = JavaTestUtils.runStreams(ssc, 3, 3);
 
-    assert(result.size() == expected.size());
+    Assert.assertEquals(expected.size(), result.size());
     for (int i = 0; i < result.size(); i++) {
-      assert(convert(result.get(i)).equals(convert(expected.get(i))));
+      Assert.assertEquals(convert(expected.get(i)), convert(result.get(i)));
     }
   }
 
@@ -1232,6 +1265,49 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
     List<List<Tuple2<String, Integer>>> result = JavaTestUtils.runStreams(ssc, 3, 3);
 
     Assert.assertEquals(expected, result);
+  }
+
+  @SuppressWarnings("unchecked")
+  @Test
+  public void testUpdateStateByKeyWithInitial() {
+    List<List<Tuple2<String, Integer>>> inputData = stringIntKVStream;
+
+    List<Tuple2<String, Integer>> initial = Arrays.asList (
+            new Tuple2<String, Integer> ("california", 1),
+            new Tuple2<String, Integer> ("new york", 2));
+
+    JavaRDD<Tuple2<String, Integer>> tmpRDD = ssc.sparkContext().parallelize(initial);
+    JavaPairRDD<String, Integer> initialRDD = JavaPairRDD.fromJavaRDD (tmpRDD);
+
+    List<List<Tuple2<String, Integer>>> expected = Arrays.asList(
+        Arrays.asList(new Tuple2<String, Integer>("california", 5),
+            new Tuple2<String, Integer>("new york", 7)),
+        Arrays.asList(new Tuple2<String, Integer>("california", 15),
+            new Tuple2<String, Integer>("new york", 11)),
+        Arrays.asList(new Tuple2<String, Integer>("california", 15),
+            new Tuple2<String, Integer>("new york", 11)));
+
+    JavaDStream<Tuple2<String, Integer>> stream = JavaTestUtils.attachTestInputStream(ssc, inputData, 1);
+    JavaPairDStream<String, Integer> pairStream = JavaPairDStream.fromJavaDStream(stream);
+
+    JavaPairDStream<String, Integer> updated = pairStream.updateStateByKey(
+        new Function2<List<Integer>, Optional<Integer>, Optional<Integer>>() {
+        @Override
+        public Optional<Integer> call(List<Integer> values, Optional<Integer> state) {
+          int out = 0;
+          if (state.isPresent()) {
+            out = out + state.get();
+          }
+          for (Integer v: values) {
+            out = out + v;
+          }
+          return Optional.of(out);
+        }
+        }, new HashPartitioner(1), initialRDD);
+    JavaTestUtils.attachTestOutputStream(updated);
+    List<List<Tuple2<String, Integer>>> result = JavaTestUtils.runStreams(ssc, 3, 3);
+
+    assertOrderInvariantEquals(expected, result);
   }
 
   @SuppressWarnings("unchecked")
@@ -1333,7 +1409,7 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
         });
 
     JavaTestUtils.attachTestOutputStream(sorted);
-    List<List<Tuple2<String, String>>> result = JavaTestUtils.runStreams(ssc, 2, 2);
+    List<List<Tuple2<Integer, Integer>>> result = JavaTestUtils.runStreams(ssc, 2, 2);
 
     Assert.assertEquals(expected, result);
   }
@@ -1606,6 +1682,7 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
         Arrays.asList(8,7));
 
     File tempDir = Files.createTempDir();
+    tempDir.deleteOnExit();
     ssc.checkpoint(tempDir.getAbsolutePath());
 
     JavaDStream<String> stream = JavaCheckpointTestUtils.attachTestInputStream(ssc, inputData, 1);
@@ -1627,6 +1704,7 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
     // will be re-processed after recovery
     List<List<Integer>> finalResult = JavaCheckpointTestUtils.runStreams(ssc, 2, 3);
     assertOrderInvariantEquals(expectedFinal, finalResult.subList(1, 3));
+    Utils.deleteRecursively(tempDir);
   }
 
 
@@ -1691,13 +1769,85 @@ public class JavaAPISuite extends LocalJavaStreamingContext implements Serializa
       StorageLevel.MEMORY_ONLY());
   }
 
+  @SuppressWarnings("unchecked")
   @Test
-  public void testTextFileStream() {
-    JavaDStream<String> test = ssc.textFileStream("/tmp/foo");
+  public void testTextFileStream() throws IOException {
+    File testDir = Utils.createTempDir(System.getProperty("java.io.tmpdir"), "spark");
+    List<List<String>> expected = fileTestPrepare(testDir);
+
+    JavaDStream<String> input = ssc.textFileStream(testDir.toString());
+    JavaTestUtils.attachTestOutputStream(input);
+    List<List<String>> result = JavaTestUtils.runStreams(ssc, 1, 1);
+
+    assertOrderInvariantEquals(expected, result);
+  }
+
+  @SuppressWarnings("unchecked")
+  @Test
+  public void testFileStream() throws IOException {
+    File testDir = Utils.createTempDir(System.getProperty("java.io.tmpdir"), "spark");
+    List<List<String>> expected = fileTestPrepare(testDir);
+
+    JavaPairInputDStream<LongWritable, Text> inputStream = ssc.fileStream(
+      testDir.toString(),
+      LongWritable.class,
+      Text.class,
+      TextInputFormat.class,
+      new Function<Path, Boolean>() {
+        @Override
+        public Boolean call(Path v1) throws Exception {
+          return Boolean.TRUE;
+        }
+      },
+      true);
+
+    JavaDStream<String> test = inputStream.map(
+      new Function<Tuple2<LongWritable, Text>, String>() {
+        @Override
+        public String call(Tuple2<LongWritable, Text> v1) throws Exception {
+          return v1._2().toString();
+        }
+    });
+
+    JavaTestUtils.attachTestOutputStream(test);
+    List<List<String>> result = JavaTestUtils.runStreams(ssc, 1, 1);
+
+    assertOrderInvariantEquals(expected, result);
   }
 
   @Test
   public void testRawSocketStream() {
     JavaReceiverInputDStream<String> test = ssc.rawSocketStream("localhost", 12345);
   }
+
+  private List<List<String>> fileTestPrepare(File testDir) throws IOException {
+    File existingFile = new File(testDir, "0");
+    Files.write("0\n", existingFile, Charset.forName("UTF-8"));
+    assertTrue(existingFile.setLastModified(1000) && existingFile.lastModified() == 1000);
+
+    List<List<String>> expected = Arrays.asList(
+      Arrays.asList("0")
+    );
+
+    return expected;
+  }
+
+  @SuppressWarnings("unchecked")
+  // SPARK-5795: no logic assertions, just testing that intended API invocations compile
+  private void compileSaveAsJavaAPI(JavaPairDStream<LongWritable,Text> pds) {
+    pds.saveAsNewAPIHadoopFiles(
+        "", "", LongWritable.class, Text.class,
+        org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat.class);
+    pds.saveAsHadoopFiles(
+        "", "", LongWritable.class, Text.class,
+        org.apache.hadoop.mapred.SequenceFileOutputFormat.class);
+    // Checks that a previous common workaround for this API still compiles
+    pds.saveAsNewAPIHadoopFiles(
+        "", "", LongWritable.class, Text.class,
+        (Class) org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat.class);
+    pds.saveAsHadoopFiles(
+        "", "", LongWritable.class, Text.class,
+        (Class) org.apache.hadoop.mapred.SequenceFileOutputFormat.class);
+  }
+
 }

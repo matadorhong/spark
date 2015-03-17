@@ -1,9 +1,10 @@
 ---
 layout: global
 title: Monitoring and Instrumentation
+description: Monitoring, metrics, and instrumentation guide for Spark SPARK_VERSION_SHORT
 ---
 
-There are several ways to monitor Spark applications.
+There are several ways to monitor Spark applications: web UIs, metrics, and external instrumentation.
 
 # Web Interfaces
 
@@ -33,13 +34,15 @@ application's UI after the application has finished.
 
 If Spark is run on Mesos or YARN, it is still possible to reconstruct the UI of a finished
 application through Spark's history server, provided that the application's event logs exist.
-You can start a the history server by executing:
+You can start the history server by executing:
 
-    ./sbin/start-history-server.sh <base-logging-directory>
+    ./sbin/start-history-server.sh
 
-The base logging directory must be supplied, and should contain sub-directories that each
-represents an application's event logs. This creates a web interface at
-`http://<server-url>:18080` by default. The history server can be configured as follows:
+When using the file-system provider class (see spark.history.provider below), the base logging
+directory must be supplied in the <code>spark.history.fs.logDirectory</code> configuration option,
+and should contain sub-directories that each represents an application's event logs. This creates a
+web interface at `http://<server-url>:18080` by default. The history server can be configured as
+follows:
 
 <table class="table">
   <tr><th style="width:21%">Environment Variable</th><th>Meaning</th></tr>
@@ -69,7 +72,21 @@ represents an application's event logs. This creates a web interface at
 <table class="table">
   <tr><th>Property Name</th><th>Default</th><th>Meaning</th></tr>
   <tr>
-    <td>spark.history.updateInterval</td>
+    <td>spark.history.provider</td>
+    <td>org.apache.spark.deploy.history.FsHistoryProvider</td>
+    <td>Name of the class implementing the application history backend. Currently there is only
+    one implementation, provided by Spark, which looks for application logs stored in the
+    file system.</td>
+  </tr>
+  <tr>
+    <td>spark.history.fs.logDirectory</td>
+    <td>file:/tmp/spark-events</td>
+    <td>
+     Directory that contains application event logs to be loaded by the history server
+    </td>
+  </tr>
+  <tr>
+    <td>spark.history.fs.update.interval.seconds</td>
     <td>10</td>
     <td>
       The period, in seconds, at which information displayed by this history server is updated.
@@ -78,7 +95,7 @@ represents an application's event logs. This creates a web interface at
   </tr>
   <tr>
     <td>spark.history.retainedApplications</td>
-    <td>250</td>
+    <td>50</td>
     <td>
       The number of application UIs to retain. If this cap is exceeded, then the oldest
       applications will be removed.
@@ -97,7 +114,7 @@ represents an application's event logs. This creates a web interface at
     <td>
       Indicates whether the history server should use kerberos to login. This is useful
       if the history server is accessing HDFS files on a secure Hadoop cluster. If this is 
-      true it looks uses the configs <code>spark.history.kerberos.principal</code> and
+      true, it uses the configs <code>spark.history.kerberos.principal</code> and
       <code>spark.history.kerberos.keytab</code>. 
     </td>
   </tr>
@@ -128,10 +145,35 @@ represents an application's event logs. This creates a web interface at
       If disabled, no access control checks are made. 
     </td>
   </tr>
+  <tr>
+    <td>spark.history.fs.cleaner.enabled</td>
+    <td>false</td>
+    <td>
+      Specifies whether the History Server should periodically clean up event logs from storage.
+    </td>
+  </tr>
+  <tr>
+    <td>spark.history.fs.cleaner.interval.seconds</td>
+    <td>86400</td>
+    <td>
+      How often the job history cleaner checks for files to delete, in seconds. Defaults to 86400 (one day).
+      Files are only deleted if they are older than spark.history.fs.cleaner.maxAge.seconds.
+    </td>
+  </tr>
+  <tr>
+    <td>spark.history.fs.cleaner.maxAge.seconds</td>
+    <td>3600 * 24 * 7</td>
+    <td>
+      Job history files older than this many seconds will be deleted when the history cleaner runs.
+      Defaults to 3600 * 24 * 7 (1 week).
+    </td>
+  </tr>
 </table>
 
 Note that in all of these UIs, the tables are sortable by clicking their headers,
 making it easy to identify slow tasks, data skew, etc.
+
+Note that the history server only displays completed Spark jobs. One way to signal the completion of a Spark job is to stop the Spark Context explicitly (`sc.stop()`), or in Python using the `with SparkContext() as sc:` to handle the Spark Context setup and tear down, and still show the job history on the UI.
 
 # Metrics
 
@@ -156,9 +198,10 @@ Each instance can report to zero or more _sinks_. Sinks are contained in the
 
 * `ConsoleSink`: Logs metrics information to the console.
 * `CSVSink`: Exports metrics data to CSV files at regular intervals.
-* `JmxSink`: Registers metrics for viewing in a JXM console.
+* `JmxSink`: Registers metrics for viewing in a JMX console.
 * `MetricsServlet`: Adds a servlet within the existing Spark UI to serve metrics data as JSON data.
 * `GraphiteSink`: Sends metrics to a Graphite node.
+* `Slf4jSink`: Sends metrics to slf4j as log entries.
 
 Spark also supports a Ganglia sink which is not included in the default build due to
 licensing restrictions:

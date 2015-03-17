@@ -15,83 +15,94 @@
 # limitations under the License.
 #
 
+import atexit
 import os
-import sys
+import select
 import signal
+import shlex
+import socket
 import platform
 from subprocess import Popen, PIPE
-from threading import Thread
 from py4j.java_gateway import java_import, JavaGateway, GatewayClient
+
+from pyspark.serializers import read_int
 
 
 def launch_gateway():
     SPARK_HOME = os.environ["SPARK_HOME"]
 
-    set_env_vars_for_yarn()
-
-    # Launch the Py4j gateway using Spark's run command so that we pick up the
-    # proper classpath and settings from spark-env.sh
-    on_windows = platform.system() == "Windows"
-    script = "./bin/spark-class.cmd" if on_windows else "./bin/spark-class"
-    command = [os.path.join(SPARK_HOME, script), "py4j.GatewayServer",
-               "--die-on-broken-pipe", "0"]
-    if not on_windows:
-        # Don't send ctrl-c / SIGINT to the Java gateway:
-        def preexec_func():
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-        proc = Popen(command, stdout=PIPE, stdin=PIPE, preexec_fn=preexec_func)
+    if "PYSPARK_GATEWAY_PORT" in os.environ:
+        gateway_port = int(os.environ["PYSPARK_GATEWAY_PORT"])
     else:
-        # preexec_fn not supported on Windows
-        proc = Popen(command, stdout=PIPE, stdin=PIPE)
-    # Determine which ephemeral port the server started on:
-    port = int(proc.stdout.readline())
-    # Create a thread to echo output from the GatewayServer, which is required
-    # for Java log output to show up:
-    class EchoOutputThread(Thread):
-        def __init__(self, stream):
-            Thread.__init__(self)
-            self.daemon = True
-            self.stream = stream
+        # Launch the Py4j gateway using Spark's run command so that we pick up the
+        # proper classpath and settings from spark-env.sh
+        on_windows = platform.system() == "Windows"
+        script = "./bin/spark-submit.cmd" if on_windows else "./bin/spark-submit"
+        submit_args = os.environ.get("PYSPARK_SUBMIT_ARGS", "pyspark-shell")
+        command = [os.path.join(SPARK_HOME, script)] + shlex.split(submit_args)
 
-        def run(self):
-            while True:
-                line = self.stream.readline()
-                sys.stderr.write(line)
-    EchoOutputThread(proc.stdout).start()
+        # Start a socket that will be used by PythonGatewayServer to communicate its port to us
+        callback_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        callback_socket.bind(('127.0.0.1', 0))
+        callback_socket.listen(1)
+        callback_host, callback_port = callback_socket.getsockname()
+        env = dict(os.environ)
+        env['_PYSPARK_DRIVER_CALLBACK_HOST'] = callback_host
+        env['_PYSPARK_DRIVER_CALLBACK_PORT'] = str(callback_port)
+
+        # Launch the Java gateway.
+        # We open a pipe to stdin so that the Java gateway can die when the pipe is broken
+        if not on_windows:
+            # Don't send ctrl-c / SIGINT to the Java gateway:
+            def preexec_func():
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+            proc = Popen(command, stdin=PIPE, preexec_fn=preexec_func, env=env)
+        else:
+            # preexec_fn not supported on Windows
+            proc = Popen(command, stdin=PIPE, env=env)
+
+        gateway_port = None
+        # We use select() here in order to avoid blocking indefinitely if the subprocess dies
+        # before connecting
+        while gateway_port is None and proc.poll() is None:
+            timeout = 1  # (seconds)
+            readable, _, _ = select.select([callback_socket], [], [], timeout)
+            if callback_socket in readable:
+                gateway_connection = callback_socket.accept()[0]
+                # Determine which ephemeral port the server started on:
+                gateway_port = read_int(gateway_connection.makefile())
+                gateway_connection.close()
+                callback_socket.close()
+        if gateway_port is None:
+            raise Exception("Java gateway process exited before sending the driver its port number")
+
+        # In Windows, ensure the Java child processes do not linger after Python has exited.
+        # In UNIX-based systems, the child process can kill itself on broken pipe (i.e. when
+        # the parent process' stdin sends an EOF). In Windows, however, this is not possible
+        # because java.lang.Process reads directly from the parent process' stdin, contending
+        # with any opportunity to read an EOF from the parent. Note that this is only best
+        # effort and will not take effect if the python process is violently terminated.
+        if on_windows:
+            # In Windows, the child process here is "spark-submit.cmd", not the JVM itself
+            # (because the UNIX "exec" command is not available). This means we cannot simply
+            # call proc.kill(), which kills only the "spark-submit.cmd" process but not the
+            # JVMs. Instead, we use "taskkill" with the tree-kill option "/t" to terminate all
+            # child processes in the tree (http://technet.microsoft.com/en-us/library/bb491009.aspx)
+            def killChild():
+                Popen(["cmd", "/c", "taskkill", "/f", "/t", "/pid", str(proc.pid)])
+            atexit.register(killChild)
+
     # Connect to the gateway
-    gateway = JavaGateway(GatewayClient(port=port), auto_convert=False)
+    gateway = JavaGateway(GatewayClient(port=gateway_port), auto_convert=False)
+
     # Import the classes used by PySpark
     java_import(gateway.jvm, "org.apache.spark.SparkConf")
     java_import(gateway.jvm, "org.apache.spark.api.java.*")
     java_import(gateway.jvm, "org.apache.spark.api.python.*")
     java_import(gateway.jvm, "org.apache.spark.mllib.api.python.*")
-    java_import(gateway.jvm, "org.apache.spark.sql.SQLContext")
-    java_import(gateway.jvm, "org.apache.spark.sql.hive.HiveContext")
-    java_import(gateway.jvm, "org.apache.spark.sql.hive.LocalHiveContext")
-    java_import(gateway.jvm, "org.apache.spark.sql.hive.TestHiveContext")
+    # TODO(davies): move into sql
+    java_import(gateway.jvm, "org.apache.spark.sql.*")
+    java_import(gateway.jvm, "org.apache.spark.sql.hive.*")
     java_import(gateway.jvm, "scala.Tuple2")
+
     return gateway
-
-def set_env_vars_for_yarn():
-    # Add the spark jar, which includes the pyspark files, to the python path
-    env_map = parse_env(os.environ.get("SPARK_YARN_USER_ENV", ""))
-    if "PYTHONPATH" in env_map:
-        env_map["PYTHONPATH"] += ":spark.jar"
-    else:
-        env_map["PYTHONPATH"] = "spark.jar"
-
-    os.environ["SPARK_YARN_USER_ENV"] = ",".join(k + '=' + v for (k, v) in env_map.items())
-
-def parse_env(env_str):
-    # Turns a comma-separated of env settings into a dict that maps env vars to
-    # their values.
-    env = {}
-    for var_str in env_str.split(","):
-        parts = var_str.split("=")
-        if len(parts) == 2:
-            env[parts[0]] = parts[1]
-        elif len(var_str) > 0:
-            print "Invalid entry in SPARK_YARN_USER_ENV: " + var_str
-            sys.exit(1)
-    
-    return env

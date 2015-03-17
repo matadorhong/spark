@@ -18,23 +18,27 @@
 package org.apache.spark.sql.columnar
 
 import java.nio.ByteBuffer
+import java.sql.Timestamp
 
 import org.scalatest.FunSuite
 
-import org.apache.spark.sql.catalyst.types._
+import org.apache.spark.Logging
+import org.apache.spark.sql.catalyst.expressions.GenericMutableRow
 import org.apache.spark.sql.columnar.ColumnarTestUtils._
 import org.apache.spark.sql.execution.SparkSqlSerializer
+import org.apache.spark.sql.types._
 
-class ColumnTypeSuite extends FunSuite {
+class ColumnTypeSuite extends FunSuite with Logging {
   val DEFAULT_BUFFER_SIZE = 512
 
   test("defaultSize") {
     val checks = Map(
       INT -> 4, SHORT -> 2, LONG -> 8, BYTE -> 1, DOUBLE -> 8, FLOAT -> 4,
-      BOOLEAN -> 1, STRING -> 8, BINARY -> 16, GENERIC -> 16)
+      FIXED_DECIMAL(15, 10) -> 8, BOOLEAN -> 1, STRING -> 8, DATE -> 4, TIMESTAMP -> 12,
+      BINARY -> 16, GENERIC -> 16)
 
     checks.foreach { case (columnType, expectedSize) =>
-      expectResult(expectedSize, s"Wrong defaultSize for $columnType") {
+      assertResult(expectedSize, s"Wrong defaultSize for $columnType") {
         columnType.defaultSize
       }
     }
@@ -44,21 +48,26 @@ class ColumnTypeSuite extends FunSuite {
     def checkActualSize[T <: DataType, JvmType](
         columnType: ColumnType[T, JvmType],
         value: JvmType,
-        expected: Int) {
+        expected: Int): Unit = {
 
-      expectResult(expected, s"Wrong actualSize for $columnType") {
-        columnType.actualSize(value)
+      assertResult(expected, s"Wrong actualSize for $columnType") {
+        val row = new GenericMutableRow(1)
+        columnType.setField(row, 0, value)
+        columnType.actualSize(row, 0)
       }
     }
 
-    checkActualSize(INT,     Int.MaxValue,    4)
-    checkActualSize(SHORT,   Short.MaxValue,  2)
-    checkActualSize(LONG,    Long.MaxValue,   8)
-    checkActualSize(BYTE,    Byte.MaxValue,   1)
-    checkActualSize(DOUBLE,  Double.MaxValue, 8)
-    checkActualSize(FLOAT,   Float.MaxValue,  4)
-    checkActualSize(BOOLEAN, true,            1)
-    checkActualSize(STRING,  "hello",         4 + "hello".getBytes("utf-8").length)
+    checkActualSize(INT, Int.MaxValue, 4)
+    checkActualSize(SHORT, Short.MaxValue, 2)
+    checkActualSize(LONG, Long.MaxValue, 8)
+    checkActualSize(BYTE, Byte.MaxValue, 1)
+    checkActualSize(DOUBLE, Double.MaxValue, 8)
+    checkActualSize(FLOAT, Float.MaxValue, 4)
+    checkActualSize(FIXED_DECIMAL(15, 10), Decimal(0, 15, 10), 8)
+    checkActualSize(BOOLEAN, true, 1)
+    checkActualSize(STRING, "hello", 4 + "hello".getBytes("utf-8").length)
+    checkActualSize(DATE, 0, 4)
+    checkActualSize(TIMESTAMP, new Timestamp(0L), 12)
 
     val binary = Array.fill[Byte](4)(0: Byte)
     checkActualSize(BINARY,  binary, 4 + 4)
@@ -86,12 +95,20 @@ class ColumnTypeSuite extends FunSuite {
 
   testNativeColumnType[DoubleType.type](DOUBLE, _.putDouble(_), _.getDouble)
 
+  testNativeColumnType[DecimalType](
+    FIXED_DECIMAL(15, 10),
+    (buffer: ByteBuffer, decimal: Decimal) => {
+      buffer.putLong(decimal.toUnscaledLong)
+    },
+    (buffer: ByteBuffer) => {
+      Decimal(buffer.getLong(), 15, 10)
+    })
+
   testNativeColumnType[FloatType.type](FLOAT, _.putFloat(_), _.getFloat)
 
   testNativeColumnType[StringType.type](
     STRING,
     (buffer: ByteBuffer, string: String) => {
-
       val bytes = string.getBytes("utf-8")
       buffer.putInt(bytes.length)
       buffer.put(bytes)
@@ -126,7 +143,7 @@ class ColumnTypeSuite extends FunSuite {
     val length = buffer.getInt()
     assert(length === serializedObj.length)
 
-    expectResult(obj, "Deserialized object didn't equal to the original object") {
+    assertResult(obj, "Deserialized object didn't equal to the original object") {
       val bytes = new Array[Byte](length)
       buffer.get(bytes, 0, length)
       SparkSqlSerializer.deserialize(bytes)
@@ -135,7 +152,7 @@ class ColumnTypeSuite extends FunSuite {
     buffer.rewind()
     buffer.putInt(serializedObj.length).put(serializedObj)
 
-    expectResult(obj, "Deserialized object didn't equal to the original object") {
+    assertResult(obj, "Deserialized object didn't equal to the original object") {
       buffer.rewind()
       SparkSqlSerializer.deserialize(GENERIC.extract(buffer))
     }
@@ -144,7 +161,7 @@ class ColumnTypeSuite extends FunSuite {
   def testNativeColumnType[T <: NativeType](
       columnType: NativeColumnType[T],
       putter: (ByteBuffer, T#JvmType) => Unit,
-      getter: (ByteBuffer) => T#JvmType) {
+      getter: (ByteBuffer) => T#JvmType): Unit = {
 
     testColumnType[T, T#JvmType](columnType, putter, getter)
   }
@@ -152,7 +169,7 @@ class ColumnTypeSuite extends FunSuite {
   def testColumnType[T <: DataType, JvmType](
       columnType: ColumnType[T, JvmType],
       putter: (ByteBuffer, JvmType) => Unit,
-      getter: (ByteBuffer) => JvmType) {
+      getter: (ByteBuffer) => JvmType): Unit = {
 
     val buffer = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE)
     val seq = (0 until 4).map(_ => makeRandomValue(columnType))
@@ -163,7 +180,7 @@ class ColumnTypeSuite extends FunSuite {
 
       buffer.rewind()
       seq.foreach { expected =>
-        println("buffer = " + buffer + ", expected = " + expected)
+        logInfo("buffer = " + buffer + ", expected = " + expected)
         val extracted = columnType.extract(buffer)
         assert(
           expected === extracted,
@@ -187,17 +204,7 @@ class ColumnTypeSuite extends FunSuite {
   }
 
   private def hexDump(value: Any): String = {
-    if (value.isInstanceOf[String]) {
-      val sb = new StringBuilder()
-      for (ch <- value.asInstanceOf[String].toCharArray) {
-        sb.append(Integer.toHexString(ch & 0xffff)).append(' ')
-      }
-      if (! sb.isEmpty) sb.setLength(sb.length - 1)
-      sb.toString()
-    } else {
-      // for now ..
-      hexDump(value.toString)
-    }
+    value.toString.map(ch => Integer.toHexString(ch & 0xffff)).mkString(" ")
   }
 
   private def dumpBuffer(buff: ByteBuffer): Any = {
@@ -206,7 +213,19 @@ class ColumnTypeSuite extends FunSuite {
       val b = buff.get()
       sb.append(Integer.toHexString(b & 0xff)).append(' ')
     }
-    if (! sb.isEmpty) sb.setLength(sb.length - 1)
+    if (sb.nonEmpty) sb.setLength(sb.length - 1)
     sb.toString()
+  }
+
+  test("column type for decimal types with different precision") {
+    (1 to 18).foreach { i =>
+      assertResult(FIXED_DECIMAL(i, 0)) {
+        ColumnType(DecimalType(i, 0))
+      }
+    }
+
+    assertResult(GENERIC) {
+      ColumnType(DecimalType(19, 0))
+    }
   }
 }

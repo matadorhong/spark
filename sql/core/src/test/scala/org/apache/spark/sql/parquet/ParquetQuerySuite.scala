@@ -17,183 +17,122 @@
 
 package org.apache.spark.sql.parquet
 
-import java.io.File
+import org.scalatest.BeforeAndAfterAll
 
-import org.scalatest.{BeforeAndAfterAll, FunSuite}
-
-import org.apache.hadoop.fs.{Path, FileSystem}
-import org.apache.hadoop.mapreduce.Job
-
-import parquet.hadoop.ParquetFileWriter
-import parquet.schema.MessageTypeParser
-import parquet.hadoop.util.ContextUtil
-
-import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.util.getTempFilePath
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Row}
+import org.apache.spark.sql.{SQLConf, QueryTest}
+import org.apache.spark.sql.catalyst.expressions.Row
 import org.apache.spark.sql.test.TestSQLContext
-import org.apache.spark.sql.TestData
-import org.apache.spark.util.Utils
-import org.apache.spark.sql.catalyst.types.{StringType, IntegerType, DataType}
-import org.apache.spark.sql.{parquet, SchemaRDD}
-
-// Implicits
 import org.apache.spark.sql.test.TestSQLContext._
 
-case class TestRDDEntry(key: Int, value: String)
+/**
+ * A test suite that tests various Parquet queries.
+ */
+class ParquetQuerySuiteBase extends QueryTest with ParquetTest {
+  val sqlContext = TestSQLContext
 
-class ParquetQuerySuite extends QueryTest with FunSuite with BeforeAndAfterAll {
-  import TestData._
-  TestData // Load test data tables.
-
-  var testRDD: SchemaRDD = null
-
-  override def beforeAll() {
-    ParquetTestData.writeFile()
-    testRDD = parquetFile(ParquetTestData.testDir.toString)
-    testRDD.registerAsTable("testsource")
+  test("simple select queries") {
+    withParquetTable((0 until 10).map(i => (i, i.toString)), "t") {
+      checkAnswer(sql("SELECT _1 FROM t where t._1 > 5"), (6 until 10).map(Row.apply(_)))
+      checkAnswer(sql("SELECT _1 FROM t as tmp where tmp._1 < 5"), (0 until 5).map(Row.apply(_)))
+    }
   }
 
-  override def afterAll() {
-    Utils.deleteRecursively(ParquetTestData.testDir)
-    // here we should also unregister the table??
+  test("appending") {
+    val data = (0 until 10).map(i => (i, i.toString))
+    createDataFrame(data).toDF("c1", "c2").registerTempTable("tmp")
+    withParquetTable(data, "t") {
+      sql("INSERT INTO TABLE t SELECT * FROM tmp")
+      checkAnswer(table("t"), (data ++ data).map(Row.fromTuple))
+    }
+    catalog.unregisterTable(Seq("tmp"))
   }
 
-  test("self-join parquet files") {
-    val x = ParquetTestData.testData.as('x)
-    val y = ParquetTestData.testData.as('y)
-    val query = x.join(y).where("x.myint".attr === "y.myint".attr)
+  test("overwriting") {
+    val data = (0 until 10).map(i => (i, i.toString))
+    createDataFrame(data).toDF("c1", "c2").registerTempTable("tmp")
+    withParquetTable(data, "t") {
+      sql("INSERT OVERWRITE TABLE t SELECT * FROM tmp")
+      checkAnswer(table("t"), data.map(Row.fromTuple))
+    }
+    catalog.unregisterTable(Seq("tmp"))
+  }
 
-    // Check to make sure that the attributes from either side of the join have unique expression
-    // ids.
-    query.queryExecution.analyzed.output.filter(_.name == "myint") match {
-      case Seq(i1, i2) if(i1.exprId == i2.exprId) =>
-        fail(s"Duplicate expression IDs found in query plan: $query")
-      case Seq(_, _) => // All good
+  test("self-join") {
+    // 4 rows, cells of column 1 of row 2 and row 4 are null
+    val data = (1 to 4).map { i =>
+      val maybeInt = if (i % 2 == 0) None else Some(i)
+      (maybeInt, i.toString)
     }
 
-    val result = query.collect()
-    assert(result.size === 9, "self-join result has incorrect size")
-    assert(result(0).size === 12, "result row has incorrect size")
-    result.zipWithIndex.foreach {
-      case (row, index) => row.zipWithIndex.foreach {
-        case (field, column) => assert(field != null, s"self-join contains null value in row $index field $column")
+    withParquetTable(data, "t") {
+      val selfJoin = sql("SELECT * FROM t x JOIN t y WHERE x._1 = y._1")
+      val queryOutput = selfJoin.queryExecution.analyzed.output
+
+      assertResult(4, "Field count mismatches")(queryOutput.size)
+      assertResult(2, "Duplicated expression ID in query plan:\n $selfJoin") {
+        queryOutput.filter(_.name == "_1").map(_.exprId).size
       }
+
+      checkAnswer(selfJoin, List(Row(1, "1", 1, "1"), Row(3, "3", 3, "3")))
     }
   }
 
-  test("Import of simple Parquet file") {
-    val result = parquetFile(ParquetTestData.testDir.toString).collect()
-    assert(result.size === 15)
-    result.zipWithIndex.foreach {
-      case (row, index) => {
-        val checkBoolean =
-          if (index % 3 == 0)
-            row(0) == true
-          else
-            row(0) == false
-        assert(checkBoolean === true, s"boolean field value in line $index did not match")
-        if (index % 5 == 0) assert(row(1) === 5, s"int field value in line $index did not match")
-        assert(row(2) === "abc", s"string field value in line $index did not match")
-        assert(row(3) === (index.toLong << 33), s"long value in line $index did not match")
-        assert(row(4) === 2.5F, s"float field value in line $index did not match")
-        assert(row(5) === 4.5D, s"double field value in line $index did not match")
-      }
+  test("nested data - struct with array field") {
+    val data = (1 to 10).map(i => Tuple1((i, Seq("val_$i"))))
+    withParquetTable(data, "t") {
+      checkAnswer(sql("SELECT _1._2[0] FROM t"), data.map {
+        case Tuple1((_, Seq(string))) => Row(string)
+      })
     }
   }
 
-  test("Projection of simple Parquet file") {
-    val scanner = new ParquetTableScan(
-      ParquetTestData.testData.output,
-      ParquetTestData.testData,
-      None)(TestSQLContext.sparkContext)
-    val projected = scanner.pruneColumns(ParquetTypesConverter
-      .convertToAttributes(MessageTypeParser
-      .parseMessageType(ParquetTestData.subTestSchema)))
-    assert(projected.output.size === 2)
-    val result = projected
-      .execute()
-      .map(_.copy())
-      .collect()
-    result.zipWithIndex.foreach {
-      case (row, index) => {
-          if (index % 3 == 0)
-            assert(row(0) === true, s"boolean field value in line $index did not match (every third row)")
-          else
-            assert(row(0) === false, s"boolean field value in line $index did not match")
-        assert(row(1) === (index.toLong << 33), s"long field value in line $index did not match")
-        assert(row.size === 2, s"number of columns in projection in line $index is incorrect")
-      }
+  test("nested data - array of struct") {
+    val data = (1 to 10).map(i => Tuple1(Seq(i -> "val_$i")))
+    withParquetTable(data, "t") {
+      checkAnswer(sql("SELECT _1[0]._2 FROM t"), data.map {
+        case Tuple1(Seq((_, string))) => Row(string)
+      })
     }
   }
 
-  test("Writing metadata from scratch for table CREATE") {
-    val job = new Job()
-    val path = new Path(getTempFilePath("testtable").getCanonicalFile.toURI.toString)
-    val fs: FileSystem = FileSystem.getLocal(ContextUtil.getConfiguration(job))
-    ParquetTypesConverter.writeMetaData(
-      ParquetTestData.testData.output,
-      path,
-      TestSQLContext.sparkContext.hadoopConfiguration)
-    assert(fs.exists(new Path(path, ParquetFileWriter.PARQUET_METADATA_FILE)))
-    val metaData = ParquetTypesConverter.readMetaData(path)
-    assert(metaData != null)
-    ParquetTestData
-      .testData
-      .parquetSchema
-      .checkContains(metaData.getFileMetaData.getSchema) // throws exception if incompatible
-    metaData
-      .getFileMetaData
-      .getSchema
-      .checkContains(ParquetTestData.testData.parquetSchema) // throws exception if incompatible
-    fs.delete(path, true)
-  }
-
-  test("Creating case class RDD table") {
-    TestSQLContext.sparkContext.parallelize((1 to 100))
-      .map(i => TestRDDEntry(i, s"val_$i"))
-      .registerAsTable("tmp")
-    val rdd = sql("SELECT * FROM tmp").collect().sortBy(_.getInt(0))
-    var counter = 1
-    rdd.foreach {
-      // '===' does not like string comparison?
-      row: Row => {
-        assert(row.getString(1).equals(s"val_$counter"), s"row $counter value ${row.getString(1)} does not match val_$counter")
-        counter = counter + 1
-      }
+  test("SPARK-1913 regression: columns only referenced by pushed down filters should remain") {
+    withParquetTable((1 to 10).map(Tuple1.apply), "t") {
+      checkAnswer(sql("SELECT _1 FROM t WHERE _1 < 10"), (1 to 9).map(Row.apply(_)))
     }
   }
 
-  test("Saving case class RDD table to file and reading it back in") {
-    val file = getTempFilePath("parquet")
-    val path = file.toString
-    val rdd = TestSQLContext.sparkContext.parallelize((1 to 100))
-      .map(i => TestRDDEntry(i, s"val_$i"))
-    rdd.saveAsParquetFile(path)
-    val readFile = parquetFile(path)
-    readFile.registerAsTable("tmpx")
-    val rdd_copy = sql("SELECT * FROM tmpx").collect()
-    val rdd_orig = rdd.collect()
-    for(i <- 0 to 99) {
-      assert(rdd_copy(i).apply(0) === rdd_orig(i).key,  s"key error in line $i")
-      assert(rdd_copy(i).apply(1) === rdd_orig(i).value, s"value in line $i")
-    }
-    Utils.deleteRecursively(file)
-    assert(true)
-  }
+  test("SPARK-5309 strings stored using dictionary compression in parquet") {
+    withParquetTable((0 until 1000).map(i => ("same", "run_" + i /100, 1)), "t") {
 
+      checkAnswer(sql("SELECT _1, _2, SUM(_3) FROM t GROUP BY _1, _2"),
+        (0 until 10).map(i => Row("same", "run_" + i, 100)))
 
-  test("insert (appending) to same table via Scala API") {
-    sql("INSERT INTO testsource SELECT * FROM testsource").collect()
-    val double_rdd = sql("SELECT * FROM testsource").collect()
-    assert(double_rdd != null)
-    assert(double_rdd.size === 30)
-    for(i <- (0 to 14)) {
-      assert(double_rdd(i) === double_rdd(i+15), s"error: lines $i and ${i+15} to not match")
+      checkAnswer(sql("SELECT _1, _2, SUM(_3) FROM t WHERE _2 = 'run_5' GROUP BY _1, _2"),
+        List(Row("same", "run_5", 100)))
     }
-    // let's restore the original test data
-    Utils.deleteRecursively(ParquetTestData.testDir)
-    ParquetTestData.writeFile()
   }
 }
 
+class ParquetDataSourceOnQuerySuite extends ParquetQuerySuiteBase with BeforeAndAfterAll {
+  val originalConf = sqlContext.conf.parquetUseDataSourceApi
+
+  override protected def beforeAll(): Unit = {
+    sqlContext.conf.setConf(SQLConf.PARQUET_USE_DATA_SOURCE_API, "true")
+  }
+
+  override protected def afterAll(): Unit = {
+    sqlContext.setConf(SQLConf.PARQUET_USE_DATA_SOURCE_API, originalConf.toString)
+  }
+}
+
+class ParquetDataSourceOffQuerySuite extends ParquetQuerySuiteBase with BeforeAndAfterAll {
+  val originalConf = sqlContext.conf.parquetUseDataSourceApi
+
+  override protected def beforeAll(): Unit = {
+    sqlContext.conf.setConf(SQLConf.PARQUET_USE_DATA_SOURCE_API, "false")
+  }
+
+  override protected def afterAll(): Unit = {
+    sqlContext.setConf(SQLConf.PARQUET_USE_DATA_SOURCE_API, originalConf.toString)
+  }
+}
